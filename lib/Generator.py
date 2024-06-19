@@ -1,73 +1,79 @@
-import jax
-
-jax.config.update("jax_platforms", "cpu")
-jax.config.update("jax_default_matmul_precision", jax.lax.Precision.HIGHEST)
-
 import jax.numpy as np
-from transformers import BartConfig, BartTokenizer, BertTokenizer
-import sys, os, warnings
-
-warnings.filterwarnings("ignore")
-
-from TransCan.lib.Generator import Generator
-from TransCan.lib.param_utils.load_params import load_params
-from TransCan.lib.en_kfw_nmt.fwd_transformer_encoder_part import (
-    fwd_transformer_encoder_part,
+import numpy as onp
+import tempfile
+import torch
+from transformers import (
+    BartConfig,
+    BartForConditionalGeneration,
+    FlaxBartForConditionalGeneration,
 )
+from transformers.modeling_outputs import BaseModelOutput
 
-ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(ROOT_DIR, "atomic-thunder-15-7.dat")
+from .param_utils.flax2jax import flax2jax
+from .param_utils.jax2flax import jax2flax
 
-params = load_params(MODEL_PATH)
-params = jax.tree_map(np.asarray, params)
-
-tokenizer_en = BartTokenizer.from_pretrained("facebook/bart-base")
-tokenizer_yue = BertTokenizer.from_pretrained("Ayaka/bart-base-cantonese")
-
-config = BartConfig.from_pretrained("Ayaka/bart-base-cantonese")
-generator = Generator(
-    {"embedding": params["decoder_embedding"], **params}, config=config
-)
-
-# generate
-
-sentences = [
-    "anaemia",
-    "Get out!",
-]
-# inputs = tokenizer_en(sentences, return_tensors='jax', padding=True)
-# src = inputs.input_ids.astype(np.uint16)
-# mask_enc_1d = inputs.attention_mask.astype(np.bool_)
-# mask_enc = np.einsum('bi,bj->bij', mask_enc_1d, mask_enc_1d)[:, None]
-
-# encoder_last_hidden_output = fwd_transformer_encoder_part(params, src, mask_enc)
-# generate_ids = generator.generate(encoder_last_hidden_output, mask_enc_1d, num_beams=5, max_length=128)
-
-# decoded_sentences = tokenizer_yue.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-# for sentence in decoded_sentences:
-#     sentence = sentence.replace(' ', '')
-#     print(sentence)
+"""
+Notes: Tricky things
+`FlaxBartForConditionalGeneration` has a `.encode` method to get the `encoder_last_hidden_output`,
+but `BartForConditionalGeneration` does not support it.
+`BartForConditionalGeneration`'s `.generate` method can accept a single `encoder_last_hidden_output`
+parameter, but `FlaxBartForConditionalGeneration` does not support it.
+So in the transformer library, both the PyTorch implementation and the Flax implementation
+have some issues.
+"""
 
 
-def transcan_translate(content: list[str]) -> list[str]:
-    inputs = tokenizer_en(content, return_tensors="jax", padding=True)
-    src = inputs.input_ids.astype(np.uint16)
-    mask_enc_1d = inputs.attention_mask.astype(np.bool_)
-    mask_enc = np.einsum("bi,bj->bij", mask_enc_1d, mask_enc_1d)[:, None]
+class Generator:
+    def __init__(
+        self,
+        params: np.ndarray,
+        config: BartConfig = BartConfig.from_pretrained("facebook/bart-base"),
+    ):
+        # params
+        decoder_embed_positions: np.ndarray = params["decoder_embed_positions"]  # array
+        decoder_embed_layer_norm: dict = params[
+            "decoder_embed_layer_norm"
+        ]  # layer norm
+        decoder_layers: list = params["decoder_layers"]  # list of transformer encoder
+        lm_head: dict = params["lm_head"]  # array
 
-    encoder_last_hidden_output = fwd_transformer_encoder_part(params, src, mask_enc)
-    generate_ids = generator.generate(
-        encoder_last_hidden_output, mask_enc_1d, num_beams=5, max_length=128
-    )
+        # randomly initialize a Flax model
+        model_flax = FlaxBartForConditionalGeneration(config=config)
 
-    decoded_sentences = tokenizer_yue.batch_decode(
-        generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
-    )
+        # extract model parameters and convert to JAX
+        params_jax = flax2jax(model_flax.params["model"])
 
-    # res = ""
-    # for sentence in decoded_sentences:
-    #     sentence = sentence.replace(" ", "")
-    #     logger.debug(sentence)
-    #     res += sentence
+        # set the decoder part of the model parameters to the given parameters
+        params_jax = {
+            **params_jax,
+            "decoder_embed_positions": decoder_embed_positions,
+            "decoder_embed_layer_norm": decoder_embed_layer_norm,
+            "decoder_layers": decoder_layers,
+        }
 
-    return decoded_sentences
+        # convert back to Flax
+        params_flax = jax2flax(params_jax)
+        model_flax.params["model"] = params_flax
+
+        # save the Flax model and reload it as a PyTorch model
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            model_flax.save_pretrained(tmpdirname)
+            model_pt = BartForConditionalGeneration.from_pretrained(
+                tmpdirname, from_flax=True
+            )
+
+        model_pt.lm_head.weight.data = torch.from_numpy(onp.asarray(lm_head.T))
+
+        self.model = model_pt
+
+    def generate(
+        self, encoder_last_hidden_output: np.ndarray, mask_enc_1d: np.ndarray, **kwargs
+    ):
+        encoder_outputs = BaseModelOutput(
+            last_hidden_state=torch.from_numpy(onp.asarray(encoder_last_hidden_output))
+        )
+        attention_mask = torch.from_numpy(onp.asarray(mask_enc_1d))
+        generate_ids = self.model.generate(
+            attention_mask=attention_mask, encoder_outputs=encoder_outputs, **kwargs
+        )
+        return np.asarray(generate_ids.numpy())
