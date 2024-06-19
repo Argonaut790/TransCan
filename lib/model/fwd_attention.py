@@ -44,7 +44,7 @@ def fwd_attention(
 
     qk = np.einsum('bdhk,bshk->bhds', q, k)  # bs, n_heads, dst_len, src_len
     qk = qk / np.sqrt(d_k)
-    qk = np.where(mask, qk, np.NINF)
+    qk = np.where(mask, qk, -np.inf)
     qk = nn.softmax(qk)
     qk = np.where(mask, qk, 0)
     # check_type(qk, qk, F[Array, 'bs n_heads dst_len src_len'])
