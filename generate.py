@@ -15,7 +15,7 @@ MODEL_PATH = os.path.join(ROOT_DIR, "atomic-thunder-15-7.dat")
 params = load_params(MODEL_PATH)
 params = jax.tree_map(np.asarray, params)
 
-tokenizer_en = BartTokenizer.from_pretrained('facebook/bart-base')
+tokenizer_en = BertTokenizer.from_pretrained("fnlp/bart-base-chinese")
 tokenizer_yue = BertTokenizer.from_pretrained('Ayaka/bart-base-cantonese')
 
 config = BartConfig.from_pretrained('Ayaka/bart-base-cantonese')
@@ -35,12 +35,32 @@ sentences = [
 # encoder_last_hidden_output = fwd_transformer_encoder_part(params, src, mask_enc)
 # generate_ids = generator.generate(encoder_last_hidden_output, mask_enc_1d, num_beams=5, max_length=128)
 
+
 # decoded_sentences = tokenizer_yue.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
 # for sentence in decoded_sentences:
 #     sentence = sentence.replace(' ', '')
 #     print(sentence)
 
-def transcan_translate(content:list[str]) -> list[str]:
+
+from functools import wraps
+import time
+
+
+def timeit(func):
+    @wraps(func)
+    def timeit_wrapper(*args, **kwargs):
+        start_time = time.perf_counter()
+        result = func(*args, **kwargs)
+        end_time = time.perf_counter()
+        total_time = end_time - start_time
+        print(f"Function {func.__name__}{args} {kwargs} Took {total_time:.4f} seconds")
+        return result
+
+    return timeit_wrapper
+
+
+@timeit
+def transcan_translate(content: list[str]) -> list[str]:
     inputs = tokenizer_en(content, return_tensors="jax", padding=True)
     src = inputs.input_ids.astype(np.uint16)
     mask_enc_1d = inputs.attention_mask.astype(np.bool_)
@@ -63,7 +83,16 @@ def transcan_translate(content:list[str]) -> list[str]:
 
     return decoded_sentences
 
-decoded_sentences = transcan_translate(sentences)
-for sentence in decoded_sentences:
-    sentence = sentence.replace(' ', '')
-    print(sentence)
+
+def main():
+    while True:
+        sentence = input("Please input a sentence: ")
+        decoded_sentences = transcan_translate([sentence])
+        for sentence in decoded_sentences:
+            sentence = sentence.replace(" ", "")
+            print(sentence)
+
+if __name__ == "__main__":
+    main()
+
+# I am testing how long does it take to translate english into ch
